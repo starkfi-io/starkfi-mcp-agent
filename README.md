@@ -36,6 +36,7 @@
 - [Configuration](#configuration)
 - [MCP client setup](#mcp-client-setup)
 - [Tool catalog](#tool-catalog)
+- [Agent skills (Cursor)](#agent-skills-cursor)
 - [Scripts](#scripts)
 - [Testing](#testing)
 - [Publishing to npm](#publishing-to-npm)
@@ -209,6 +210,21 @@ Tools are grouped by domain. Each tool includes a description in the MCP client 
 | `kyc_*` | KYC flow: prepare, OTP, verify, Didit session, status |
 
 **API path convention:** requests use the configured StarkFi host with **root-relative** paths (no `/api/` prefix), e.g. `GET /yield/strategies`, `GET /kyc/status`.
+
+---
+
+## Agent skills (Cursor)
+
+This repository includes **Cursor Agent Skills** under [`agent-skills/`](agent-skills/README.md): reusable `SKILL.md` instructions for the agent when integrating yield, payments, KYC, or the MCP server itself.
+
+Copy each skill folder into **`.cursor/skills/`** so Cursor loads them (see the index in [`agent-skills/README.md`](agent-skills/README.md)).
+
+| Skill folder | Focus |
+|--------------|--------|
+| `starkfi-mcp-overview` | Host, env, tool prefixes, secrets |
+| `starkfi-mcp-yield` | Deposit / withdraw / rebalance / broadcast |
+| `starkfi-mcp-payments` | Orders and StarkPay lifecycle |
+| `starkfi-mcp-kyc-compliance` | Ordered KYC and Didit flow |
 
 ---
 
