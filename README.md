@@ -9,20 +9,21 @@
   <a href="https://www.npmjs.com/package/starkfi-mcp"><img src="https://img.shields.io/npm/v/starkfi-mcp?label=npm&logo=npm" alt="npm version"></a>
   <img src="https://img.shields.io/node/v/starkfi-mcp" alt="Node version">
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License MIT">
-  <a href="https://starkfi.mintlify.app/"><img src="https://img.shields.io/badge/docs-StarkFi-0A0A0A?logo=readthedocs&logoColor=white" alt="StarkFi docs"></a>
+  <a href="https://docs.starkfi.io/"><img src="https://img.shields.io/badge/docs-StarkFi-0A0A0A?logo=readthedocs&logoColor=white" alt="StarkFi docs"></a>
 </p>
 
 ---
 
 ## Overview
 
-**starkfi-mcp** connects AI assistants (Cursor, Claude Desktop, and other MCP hosts) to **[StarkFi](https://starkfi.mintlify.app/)**—payments, yield, orders, and KYC—through a typed **tool** surface instead of ad-hoc REST calls.
+**starkfi-mcp** connects AI assistants (Cursor, Claude Desktop, and other MCP hosts) to **[StarkFi](https://docs.starkfi.io/)**—payments, yield, orders, and KYC—through a typed **tool** surface instead of ad-hoc REST calls. Tool metadata is written for **domain context**, not only parameter types: when to call each tool, typical **success response** shapes, **ordered flows** (orders → StarkPay → broadcast → status; KYC steps; yield build → broadcast), and **common API error `status` values** with recovery guidance.
 
 | Aspect | Detail |
 |--------|--------|
 | **Protocol** | [MCP](https://modelcontextprotocol.io/) over **stdio** (stdin/stdout JSON-RPC) |
 | **Runtime** | Node.js **20+** |
-| **Validation** | [Zod](https://zod.dev/) schemas per tool |
+| **Validation** | [Zod](https://zod.dev/) schemas per tool (patterns, enums, cross-field rules where documented) |
+| **HTTP errors** | `formatApiError` in `src/lib/errors.ts` appends **`Recovery hint:`** for many known StarkFi cases (auth, rate limit, validation, Solana blockhash expiry, payment/KYC flows) |
 | **Default API host** | `https://api.starkfi.io` (see [Configuration](#configuration)) |
 
 ---
@@ -36,6 +37,7 @@
 - [Configuration](#configuration)
 - [MCP client setup](#mcp-client-setup)
 - [Tool catalog](#tool-catalog)
+- [Agent-oriented tool design](#agent-oriented-tool-design)
 - [Agent skills (Cursor)](#agent-skills-cursor)
 - [Scripts](#scripts)
 - [Testing](#testing)
@@ -52,6 +54,7 @@
 - **StarkPay** — payment status, register intents, create transaction, on-chain broadcast, card tokenization payload.
 - **KYC** — prepare user, email OTP, verify OTP, Didit session, status lookup.
 - **Environment** — optional `.env` loading via `dotenv`; MCP `env` block still supported.
+- **Agent-oriented metadata** — tool descriptions summarize StarkFi semantics (broadcast rules, multichain wallets on order splits, card tokenization vs raw card data).
 
 ---
 
@@ -70,10 +73,10 @@ After the package is published to npm, consumers can run it without cloning the 
 STARKFI_API_KEY="your_key_here" npx -y starkfi-mcp
 ```
 
-Pin a version for reproducible installs:
+Pin a version for reproducible installs (match the version you want from [npm](https://www.npmjs.com/package/starkfi-mcp)):
 
 ```bash
-STARKFI_API_KEY="your_key_here" npx -y starkfi-mcp@1.0.0
+STARKFI_API_KEY="your_key_here" npx -y starkfi-mcp@1.0.1
 ```
 
 Add as a project dependency:
@@ -136,28 +139,11 @@ Prompts for your StarkFi API key (and optional base URL) and writes `.env` in th
 
 ## MCP client setup
 
-### Claude Desktop
+MCP hosts spawn this server as a **child process** and talk over **stdio**. Use **`npx`** when you consume the published package (recommended for docs, teammates, and any machine without a local clone). Use **`node` + absolute path** only on your own machine when developing from a Git checkout (after `npm run build`).
 
-1. Open **Settings → Developer → Edit Config** (or edit the JSON file manually).  
-2. Typical path on **macOS**:  
-   `~/Library/Application Support/Claude/claude_desktop_config.json`  
-3. Merge a `mcpServers` entry (use a **absolute** path when pointing at `dist/index.js`):
+### Recommended: `npx` (published package)
 
-```json
-{
-  "mcpServers": {
-    "starkfi": {
-      "command": "node",
-      "args": ["/absolute/path/to/starkfi-agent/dist/index.js"],
-      "env": {
-        "STARKFI_API_KEY": "your_key_here"
-      }
-    }
-  }
-}
-```
-
-**Using `npx` (after npm publish):**
+Use this in **Cursor**, **Claude Desktop**, and any other MCP client. Paths stay portable; each user sets their own `STARKFI_API_KEY` in the `env` block (never commit real keys).
 
 ```json
 {
@@ -173,15 +159,36 @@ Prompts for your StarkFi API key (and optional base URL) and writes `.env` in th
 }
 ```
 
-Restart Claude Desktop after saving.
+- **`npx`** must be on the `PATH` seen by the IDE (install Node from [nodejs.org](https://nodejs.org/) or your package manager).  
+- **`-y`** accepts the package download without an interactive prompt.  
+- **Pin a version** in `args` if you want reproducible installs, e.g. `["-y", "starkfi-mcp@1.0.1"]`.
 
-### Cursor
+**Claude Desktop:** Settings → Developer → Edit Config. On macOS the file is often  
+`~/Library/Application Support/Claude/claude_desktop_config.json` — merge the `mcpServers` entry above and restart the app.
 
-Add an MCP server under **Settings → MCP** using the same `command`, `args`, and `env` pattern as above.
+**Cursor:** Settings → MCP → add or edit the server JSON using the same `command`, `args`, and `env`.
 
-### Global binary
+### Local development: `node` + absolute path to `dist/index.js`
 
-If `starkfi-mcp` is on your `PATH` (`npm install -g starkfi-mcp` or `npm link`):
+Use this **only** when you are running from a **clone of this repository** on **your** machine. You must run `npm install` and `npm run build` first so `dist/index.js` exists. Replace the path with your real project path; do **not** publish this snippet as the “official” setup for third parties (their paths differ).
+
+```json
+{
+  "mcpServers": {
+    "starkfi": {
+      "command": "node",
+      "args": ["/absolute/path/to/your/checkout/dist/index.js"],
+      "env": {
+        "STARKFI_API_KEY": "your_key_here"
+      }
+    }
+  }
+}
+```
+
+### Optional: global binary (`starkfi-mcp`)
+
+If the `starkfi-mcp` executable is on your `PATH` (for example `npm install -g starkfi-mcp` or `npm link` from the repo after a build):
 
 ```json
 {
@@ -195,6 +202,15 @@ If `starkfi-mcp` is on your `PATH` (`npm install -g starkfi-mcp` or `npm link`):
   }
 }
 ```
+
+GUI apps on macOS often inherit a **minimal `PATH`**, so the global npm bin directory may be missing and the spawn fails. Prefer **`npx`** unless you know the binary resolves correctly.
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|--------|--------|-----|
+| `spawn starkfi-mcp ENOENT` | The host tried to run `starkfi-mcp` but no executable was found (not installed globally, or not on `PATH`). | Use **`npx`** with `args: ["-y", "starkfi-mcp"]`, or use **`node`** with an absolute path to `dist/index.js` after `npm run build`. |
+| Server fails immediately (local) | `dist/` missing. | Run `npm run build` from the repository root. |
 
 ---
 
@@ -210,6 +226,21 @@ Tools are grouped by domain. Each tool includes a description in the MCP client 
 | `kyc_*` | KYC flow: prepare, OTP, verify, Didit session, status |
 
 **API path convention:** requests use the configured StarkFi host with **root-relative** paths (no `/api/` prefix), e.g. `GET /yield/strategies`, `GET /kyc/status`.
+
+---
+
+## Agent-oriented tool design
+
+This server is tuned so models **reason about StarkFi**, not only emit JSON.
+
+| Concern | What the codebase does |
+|---------|-------------------------|
+| **When to call** | Each tool’s MCP `description` states intent (read vs write, polling vs one-shot) and **dependencies** between tools. |
+| **Valid payloads** | Zod enforces documented shapes where possible (for example CUID-like ids, chain slugs, `payment_method_allowed` with at least one method enabled, `transaction_type`-specific fields on `starkpay_create_transaction`, Solana yield wallets, Solana or EVM `receiver_wallet` on order splits). |
+| **Success envelopes** | Descriptions reference typical `{ success, status, message, data }`-style responses so the agent knows what fields to read next. |
+| **Failures** | Non-2xx HTTP responses throw; the message includes parsed body fields and, when matched, a **`Recovery hint:`** line (see `src/lib/errors.ts`). |
+| **Rate limits** | Per [StarkFi Authentication](https://docs.starkfi.io/authentication): **600 requests per minute** and **10 requests per second** per API key. On `429`, use exponential backoff with jitter; tool descriptions remind the model of this cadence. |
+| **On-chain payments** | StarkPay and yield flows require signing locally, then submitting through StarkFi’s **broadcast** endpoints—**not** `sendTransaction` from the user’s wallet for those flows. See the StarkFi guides linked from [docs.starkfi.io](https://docs.starkfi.io/). |
 
 ---
 
@@ -270,14 +301,18 @@ Copy each skill folder into **`.cursor/skills/`** so Cursor loads them (see the 
 
 > **Never commit real API keys.** Use the MCP host `env` block, a local `.env` (gitignored), or your OS secret manager. Treat `STARKFI_API_KEY` like any production secret.
 
+- **Header name** must be exactly `x-api-key` (see [Authentication](https://docs.starkfi.io/authentication)); other header names are rejected.
+- **Card and KYC payloads** may contain PII; do not log full card numbers, CVV, or raw verification payloads into chat transcripts. Prefer **`starkpay_tokenize_card`** and pass only **`card_token`** in create-transaction flows when the API allows it.
+- **KYC** for on-ramp and fiat/card rails is required at the account level per StarkFi; align product behavior with [dashboard](https://starkfi.io/) and compliance guidance.
+
 ---
 
 ## References
 
 | Resource | URL |
 |----------|-----|
-| StarkFi documentation | [starkfi.mintlify.app](https://starkfi.mintlify.app/) |
-| LLM-friendly index | [starkfi.mintlify.app/llms.txt](https://starkfi.mintlify.app/llms.txt) |
+| StarkFi documentation | [docs.starkfi.io](https://docs.starkfi.io/) |
+| LLM-friendly index (`llms.txt`) | [docs.starkfi.io/llms.txt](https://docs.starkfi.io/llms.txt) |
 | Model Context Protocol | [modelcontextprotocol.io](https://modelcontextprotocol.io/) |
 
 ---

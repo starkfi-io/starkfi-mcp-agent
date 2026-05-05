@@ -4,6 +4,22 @@ import type { StarkFiHttpClient } from "../lib/http-client.js";
 import { jsonResult } from "./helpers.js";
 
 const providerSchema = z.enum(["jupiter_lend", "kamino"]);
+const CHAIN_NAME_PATTERN = /^[a-z0-9_-]{2,32}$/i;
+const SYMBOL_PATTERN = /^[A-Z0-9]{2,20}$/;
+const SOLANA_WALLET_PATTERN = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+const POSITIVE_DECIMAL_PATTERN = /^(?:0|[1-9]\d*)(?:\.\d+)?$/;
+const POSITION_ID_PATTERN = /^c[a-z0-9]{20,}$/;
+const BASE64_WIRE_PATTERN = /^[A-Za-z0-9+/=]+$/;
+
+const YIELD_FLOW_NOTE =
+  "Flow dependencies: yield_list_strategies/yield_get_earnings -> yield_build_deposit|withdraw|rebalance -> user signs -> yield_broadcast.";
+const RATE_LIMIT_NOTE =
+  "Rate limits: 600 req/min and 10 req/s per API key. On 429, use exponential backoff with jitter.";
+
+const positiveDecimalStringSchema = z
+  .string()
+  .regex(POSITIVE_DECIMAL_PATTERN, "Amount must be a decimal string.")
+  .refine((v) => Number(v) > 0, "Amount must be greater than zero.");
 
 export function registerYieldTools(server: McpServer, client: StarkFiHttpClient): void {
   server.registerTool(
@@ -11,7 +27,8 @@ export function registerYieldTools(server: McpServer, client: StarkFiHttpClient)
     {
       title: "List yield strategies",
       description:
-        "**When to use:** The user wants to see available yield / lending opportunities (APYs, protocols like Jupiter Lend and Kamino) across supported assets. Use before suggesting deposits or comparing yields. Read-only.",
+        "**When to use:** Discover all available yield/lending strategies before suggesting deposits/rebalances.\n\n**Success shape:** `{ status: \"get_yield_strategies_ok\", data: { strategies: [...], sources: {...} } }`.\n\n**Common errors + recovery:** `get_yield_strategies_failed` (502) -> transient provider failure, retry with backoff.\n\n" +
+        RATE_LIMIT_NOTE,
     },
     async () => {
       const data = await client.requestJson<unknown>("GET", "/yield/strategies");
@@ -24,12 +41,13 @@ export function registerYieldTools(server: McpServer, client: StarkFiHttpClient)
     {
       title: "Get yield strategies by token symbol",
       description:
-        "**When to use:** The user asks for yield options for one token (e.g. USDC, SOL). Case-insensitive symbol filter. Read-only.",
+        "**When to use:** Retrieve strategy options for one asset symbol (`USDC`, `SOL`, etc).\n\n**Success shape:** `{ status: \"get_yield_strategies_ok\", data: { strategies, sources } }`.\n\n**Common errors + recovery:** `yield_strategy_not_found` -> call yield_list_strategies and choose supported symbols.\n\n" +
+        RATE_LIMIT_NOTE,
       inputSchema: {
         symbol: z
           .string()
-          .min(1)
-          .describe("Token symbol, e.g. USDC or SOL"),
+          .regex(SYMBOL_PATTERN, "Use asset symbol format like USDC/SOL.")
+          .describe("Token symbol, e.g. `USDC` or `SOL`. Case-insensitive server-side."),
       },
     },
     async ({ symbol }) => {
@@ -44,10 +62,12 @@ export function registerYieldTools(server: McpServer, client: StarkFiHttpClient)
     {
       title: "List rebalance opportunities",
       description:
-        "**When to use:** Compare APYs across protocols to find better yield destinations or to power rebalance suggestions. Optionally filter by asset symbol. Read-only.",
+        "**When to use:** Compare APYs across providers to suggest better destinations before building rebalance.\n\n**Success shape:** `{ status: \"get_rebalance_opportunities_ok\", data: { opportunities: [...], sources } }`.\n\n**Common errors + recovery:** `get_rebalance_opportunities_failed` -> retry after short delay.\n\n" +
+        RATE_LIMIT_NOTE,
       inputSchema: {
         asset_symbol: z
           .string()
+          .regex(SYMBOL_PATTERN, "Use asset symbol format like USDC/SOL.")
           .optional()
           .describe(
             "If set, returns opportunities for this symbol only (e.g. USDC). Omit for all tokens.",
@@ -68,14 +88,16 @@ export function registerYieldTools(server: McpServer, client: StarkFiHttpClient)
     {
       title: "Yield earnings and positions",
       description:
-        "**When to use:** Show the user's tracked yield positions, balances, profit estimates, or reconciliation state. Requires wallet (and typically chain). Read-only.",
+        "**When to use:** Inspect tracked positions and profit estimates before withdraw/rebalance decisions.\n\n**Success shape:** `{ status: \"get_earnings_position\", data: { profits: [...] } }`.\n\n**Common errors + recovery:** `params_mismatch` -> verify wallet + optional filters.\n\n" +
+        RATE_LIMIT_NOTE,
       inputSchema: {
         wallet: z
           .string()
-          .min(1)
-          .describe("User wallet public key (Solana-style in docs)"),
+          .regex(SOLANA_WALLET_PATTERN, "Expected Solana wallet address (base58).")
+          .describe("User Solana public key."),
         chain_name: z
           .string()
+          .regex(CHAIN_NAME_PATTERN)
           .optional()
           .describe("Chain filter, e.g. solana"),
         wallet_manager: z
@@ -109,13 +131,25 @@ export function registerYieldTools(server: McpServer, client: StarkFiHttpClient)
     {
       title: "Build yield deposit (unsigned tx)",
       description:
-        "**When to use:** User wants to deposit into a yield strategy. Returns an unsigned Solana transaction (base64) and position_id for broadcast — the user must sign; then call yield_broadcast. Do not broadcast from the user's wallet outside StarkFi.",
+        "**When to use:** Build a deposit operation and obtain unsigned Solana wire for user signature.\n\n**Success shape:** `{ status: \"deposit_yield_strategy_ok\", data: { position_id, transaction } }`.\n\n**Common errors + recovery:** `invalid_parameters` -> validate chain/provider/asset; `deposit_yield_strategy_failed` -> transient infra/provider failure.\n\n" +
+        YIELD_FLOW_NOTE +
+        "\n\n" +
+        RATE_LIMIT_NOTE,
       inputSchema: {
         provider: providerSchema,
-        chain_name: z.string().min(1).describe("Enabled chain, e.g. solana"),
-        asset: z.string().min(1).describe("Token symbol or mint accepted by the provider"),
-        wallet: z.string().min(1).describe("User Solana public key"),
-        amount: z.string().min(1).describe('Decimal amount as string, e.g. "10.0"'),
+        chain_name: z
+          .string()
+          .regex(CHAIN_NAME_PATTERN)
+          .describe("Enabled chain slug, e.g. `solana`."),
+        asset: z
+          .string()
+          .regex(/^[A-Za-z0-9._-]{2,64}$/)
+          .describe("Token symbol or mint accepted by provider."),
+        wallet: z
+          .string()
+          .regex(SOLANA_WALLET_PATTERN, "Expected Solana wallet address (base58).")
+          .describe("User Solana public key."),
+        amount: positiveDecimalStringSchema.describe('Decimal amount as string, e.g. "10.0".'),
       },
     },
     async (args) => {
@@ -137,13 +171,16 @@ export function registerYieldTools(server: McpServer, client: StarkFiHttpClient)
     {
       title: "Build yield withdraw (unsigned tx)",
       description:
-        "**When to use:** User wants to withdraw from a yield position. Returns unsigned transaction and fee_policy metadata. Sign then call yield_broadcast with operation withdraw.",
+        "**When to use:** Build withdraw operation and receive unsigned Solana wire + fee policy metadata.\n\n**Success shape:** `{ status: \"withdraw_yield_strategy_ok\", data: { position_id, fee_policy, transaction } }`.\n\n**Common errors + recovery:** `invalid_withdraw_position` -> reduce amount/check principal; `withdraw_position_not_found` -> refresh positions first.\n\n" +
+        YIELD_FLOW_NOTE +
+        "\n\n" +
+        RATE_LIMIT_NOTE,
       inputSchema: {
         provider: providerSchema,
-        chain_name: z.string().min(1),
-        asset: z.string().min(1),
-        wallet: z.string().min(1),
-        amount: z.string().min(1).describe("Amount to withdraw as decimal string"),
+        chain_name: z.string().regex(CHAIN_NAME_PATTERN),
+        asset: z.string().regex(/^[A-Za-z0-9._-]{2,64}$/),
+        wallet: z.string().regex(SOLANA_WALLET_PATTERN, "Expected Solana wallet address (base58)."),
+        amount: positiveDecimalStringSchema.describe("Amount to withdraw as decimal string."),
       },
     },
     async (args) => {
@@ -165,12 +202,18 @@ export function registerYieldTools(server: McpServer, client: StarkFiHttpClient)
     {
       title: "Build yield rebalance (unsigned tx)",
       description:
-        "**When to use:** Move principal between yield protocols (or refresh same protocol). Uses PATCH. Returns position_out_id, position_in_id, and transaction(s). Sign and broadcast via yield_broadcast.",
+        "**When to use:** Move principal between providers (or refresh same provider) and get unsigned transaction(s) for signature.\n\n**Success shape:** `{ status: \"rebalance_yield_strategy_ok\", data: { position_out_id, position_in_id, rebalance: { details: { mode, transaction|withdraw_transaction+deposit_transaction }}}}`.\n\n**Common errors + recovery:** `rebalance_position_out_not_found` -> refresh earnings; `invalid_parameters` -> send `provider` OR `provider_in + provider_out`.\n\n" +
+        YIELD_FLOW_NOTE +
+        "\n\n" +
+        RATE_LIMIT_NOTE,
       inputSchema: {
-        chain_name: z.string().min(1),
-        wallet: z.string().min(1).describe("User pubkey (alias signer may exist server-side)"),
-        asset: z.string().min(1),
-        amount: z.string().min(1).describe("Amount as string, must be > 0"),
+        chain_name: z.string().regex(CHAIN_NAME_PATTERN),
+        wallet: z
+          .string()
+          .regex(SOLANA_WALLET_PATTERN, "Expected Solana wallet address (base58).")
+          .describe("User pubkey (alias signer may exist server-side)."),
+        asset: z.string().regex(/^[A-Za-z0-9._-]{2,64}$/),
+        amount: positiveDecimalStringSchema.describe("Amount as string, must be > 0."),
         provider_out: providerSchema.optional(),
         provider_in: providerSchema.optional(),
         provider: providerSchema.optional().describe(
@@ -197,8 +240,18 @@ export function registerYieldTools(server: McpServer, client: StarkFiHttpClient)
   );
 
   const opSignedSchema = z.union([
-    z.string().min(1),
-    z.array(z.string().min(1)).min(1),
+    z
+      .string()
+      .regex(BASE64_WIRE_PATTERN, "Expected base64 signed transaction wire.")
+      .min(1),
+    z
+      .array(
+        z
+          .string()
+          .regex(BASE64_WIRE_PATTERN, "Expected base64 signed transaction wire.")
+          .min(1),
+      )
+      .length(2),
   ]);
 
   server.registerTool(
@@ -206,7 +259,8 @@ export function registerYieldTools(server: McpServer, client: StarkFiHttpClient)
     {
       title: "Broadcast yield operation",
       description:
-        "**When to use:** After the user signed the unsigned transaction from yield_build_deposit, yield_build_withdraw, or yield_build_rebalance. operation: deposit | withdraw | rebalance. For rebalance, op_signed may be one base64 string or two [withdraw, deposit].",
+        "**When to use:** Submit signed Solana wire(s) created by yield build endpoints. Never bypass StarkFi broadcast.\n\n**Success shape:** `{ status: \"broadcast_*_yield_strategy_ok\", data: { status, transactionHash, position_in?, position_out? } }`.\n\n**Common errors + recovery:** `invalid_parameters` -> required position ids missing; `solana_blockhash_expired` -> rebuild, re-sign, and rebroadcast quickly.\n\n" +
+        RATE_LIMIT_NOTE,
       inputSchema: {
         operation: z.enum(["deposit", "withdraw", "rebalance"]),
         op_signed: opSignedSchema.describe(
@@ -214,13 +268,29 @@ export function registerYieldTools(server: McpServer, client: StarkFiHttpClient)
         ),
         position_id: z
           .string()
+          .regex(POSITION_ID_PATTERN, "Expected StarkFi position CUID-like id.")
           .optional()
           .describe("Required for deposit and withdraw (from build response)"),
-        position_out_id: z.string().optional().describe("Required for rebalance (source)"),
-        position_in_id: z.string().optional().describe("Required for rebalance (destination)"),
+        position_out_id: z
+          .string()
+          .regex(POSITION_ID_PATTERN, "Expected StarkFi position CUID-like id.")
+          .optional()
+          .describe("Required for rebalance (source)"),
+        position_in_id: z
+          .string()
+          .regex(POSITION_ID_PATTERN, "Expected StarkFi position CUID-like id.")
+          .optional()
+          .describe("Required for rebalance (destination)"),
       },
     },
     async (args) => {
+      if ((args.operation === "deposit" || args.operation === "withdraw") && !args.position_id) {
+        throw new Error("position_id is required for deposit and withdraw operations.");
+      }
+      if (args.operation === "rebalance" && (!args.position_out_id || !args.position_in_id)) {
+        throw new Error("position_out_id and position_in_id are required for rebalance operations.");
+      }
+
       const body: Record<string, unknown> = {
         operation: args.operation,
         op_signed: args.op_signed,

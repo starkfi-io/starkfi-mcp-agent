@@ -3,34 +3,70 @@ import { z } from "zod";
 import type { StarkFiHttpClient } from "../lib/http-client.js";
 import { jsonResult } from "./helpers.js";
 
+const CUID_PATTERN = /^c[a-z0-9]{20,}$/;
+const MONEY_DECIMAL_PATTERN = /^(?:0|[1-9]\d*)(?:\.\d+)?$/;
+const CURRENCY_SYMBOL_PATTERN = /^[A-Z0-9]{2,12}$/;
+const CHAIN_NAME_PATTERN = /^[a-z0-9_-]{2,32}$/i;
+const SOLANA_WALLET_PATTERN = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+const EVM_WALLET_PATTERN = /^0x[a-fA-F0-9]{40}$/;
+const URL_HTTP_PATTERN = /^https?:\/\/.+/i;
+
+const chainAgnosticWalletSchema = z
+  .string()
+  .refine(
+    (value) => SOLANA_WALLET_PATTERN.test(value) || EVM_WALLET_PATTERN.test(value),
+    "Expected Solana base58 (32-44 chars) or EVM 0x address (42 chars).",
+  );
+
+const ORDER_FLOW_NOTE =
+  "Flow dependencies: order_create -> starkpay_register_intents_create_order -> starkpay_create_transaction -> starkpay_broadcast_on_chain -> starkpay_payment_status.";
+const RATE_LIMIT_NOTE =
+  "Rate limits: 600 req/min and 10 req/s per API key. On 429, backoff and retry with jitter.";
+
 const paymentMethodAllowedSchema = z
   .object({
     pixcrypto: z.boolean().optional(),
     cardcrypto: z.boolean().optional(),
     cardfiat: z.boolean().optional(),
     cryptopix: z.boolean().optional(),
+    cryptofiat: z.boolean().optional(),
     crypto: z.boolean().optional(),
   })
-  .passthrough();
+  .passthrough()
+  .refine((value) => Object.values(value).some(Boolean), {
+    message: "At least one payment method must be true.",
+  });
 
 const splitReceiverSchema = z.object({
-  receiver_wallet: z.string().min(1),
-  receiver_percent: z.number(),
+  receiver_wallet: chainAgnosticWalletSchema.describe(
+    "Wallet that receives this split leg (Solana base58 or EVM 0x, per destination chain).",
+  ),
+  receiver_percent: z
+    .number()
+    .min(0)
+    .max(100)
+    .describe("Percentage allocated to this receiver. Must be between 0 and 100."),
 });
 
 const orderItemSchema = z
   .object({
-    name: z.string().optional(),
-    description: z.string().optional(),
-    quantity: z.number().optional(),
-    image_url: z.string().optional(),
+    name: z.string().min(1).max(120).optional(),
+    description: z.string().max(600).optional(),
+    quantity: z.number().int().min(1).optional(),
+    image_url: z
+      .string()
+      .regex(URL_HTTP_PATTERN, "image_url must start with http:// or https://")
+      .optional(),
   })
   .passthrough();
 
 const tenantDataSchema = z
   .object({
     public_client_id: z.string().optional(),
-    webhook_url: z.string().optional(),
+    webhook_url: z
+      .string()
+      .regex(URL_HTTP_PATTERN, "webhook_url must start with http:// or https://")
+      .optional(),
   })
   .passthrough();
 
@@ -40,7 +76,8 @@ export function registerOrderTools(server: McpServer, client: StarkFiHttpClient)
     {
       title: "List payment orders",
       description:
-        "**When to use:** Paginated list of reusable payment order templates for the tenant (newest first). Use for checkout configuration history or to pick an order_id. Read-only.",
+        "**When to use:** Paginated list of reusable payment order templates for the tenant (newest first). Useful to select an `order_id` before register intents.\n\n**Success shape:** `{ status: \"orders_listed\", data: { orders: [...], pagination: { total, page, limit, total_pages }}}`.\n\n**Common errors + recovery:** `invalid_parameters` -> keep `page >= 1` and `1 <= limit <= 100`; `customer_not_logged`/403 -> verify API key.\n\n" +
+        RATE_LIMIT_NOTE,
       inputSchema: {
         page: z.number().int().min(1).optional().describe("Page number, default 1"),
         limit: z.number().int().min(1).max(100).optional().describe("Page size, default 20, max 100"),
@@ -69,9 +106,13 @@ export function registerOrderTools(server: McpServer, client: StarkFiHttpClient)
     {
       title: "Get order by ID",
       description:
-        "**When to use:** Fetch one payment order template by CUID (payment_orders.id). Use before updating or referencing an order in payment flows. Read-only.",
+        "**When to use:** Fetch one payment order template by CUID (`payment_orders.id`) before updates or transaction registration.\n\n**Success shape:** `{ status: \"order_found\", data: { ...order } }` (shape can evolve).\n\n**Common errors + recovery:** `order_not_found` -> list orders and use a tenant-owned id.\n\n" +
+        RATE_LIMIT_NOTE,
       inputSchema: {
-        order_id: z.string().min(1).describe("Order CUID"),
+        order_id: z
+          .string()
+          .regex(CUID_PATTERN, "Expected StarkFi CUID-like id starting with 'c'.")
+          .describe("Order CUID from order_create or order_list."),
       },
     },
     async ({ order_id }) => {
@@ -86,15 +127,30 @@ export function registerOrderTools(server: McpServer, client: StarkFiHttpClient)
     {
       title: "Create payment order template",
       description:
-        "**When to use:** Create a fixed reusable order (max 20 per tenant). Used with StarkPay register intents (order_code). Requires currencies, split config, and payment_method_allowed.",
+        "**When to use:** Create a fixed reusable order (max 20 per tenant). Always create/choose an order before `starkpay_register_intents_create_order`.\n\n**Success shape:** `{ status: \"order_created\", data: { order_id } }`.\n\n**Common errors + recovery:** `invalid_parameters` -> enable at least one payment method; `order_limit_reached` -> reuse/disable old templates.\n\n" +
+        ORDER_FLOW_NOTE +
+        "\n\n" +
+        RATE_LIMIT_NOTE,
       inputSchema: {
         executor_id: z
+          .enum(["api_transaction"])
+          .describe("Caller identifier. Use `api_transaction` for API automation."),
+        from_currency_symbol: z
           .string()
-          .describe("Use api_transaction when the request comes from API automation"),
-        from_currency_symbol: z.string().min(1),
-        amount_from: z.string().min(1),
-        to_currency_symbol: z.string().min(1),
-        to_chain: z.string().min(1),
+          .regex(CURRENCY_SYMBOL_PATTERN)
+          .describe("Source fiat/currency symbol enabled for tenant, e.g. `BRL`, `USD`."),
+        amount_from: z
+          .string()
+          .regex(MONEY_DECIMAL_PATTERN)
+          .describe('Source amount as decimal string, e.g. "100.00".'),
+        to_currency_symbol: z
+          .string()
+          .regex(CURRENCY_SYMBOL_PATTERN)
+          .describe("Destination symbol, e.g. `USDT`, `USDC`."),
+        to_chain: z
+          .string()
+          .regex(CHAIN_NAME_PATTERN)
+          .describe("Destination chain slug enabled on tenant, e.g. `solana`, `arbitrum`."),
         on_ramp: z.boolean(),
         gateway_method: z.enum(["direct", "subs"]),
         payment_method_allowed: paymentMethodAllowedSchema,
@@ -128,11 +184,18 @@ export function registerOrderTools(server: McpServer, client: StarkFiHttpClient)
     {
       title: "Partially update payment order",
       description:
-        "**When to use:** Change fields on an existing order template (e.g. amount_from, gateway_method). Arrays merge by index; subscription_payment_config shallow-merges. Send only fields to change in patch.",
+        "**When to use:** Patch an existing order template (`amount_from`, payment methods, etc). Arrays merge by index and subscription config shallow-merges.\n\n**Success shape:** `{ status: \"order_updated\", data: { ...updatedOrder } }`.\n\n**Common errors + recovery:** `no_fields_to_update` -> provide at least one field; `order_not_found` -> ensure id belongs to this tenant.\n\n" +
+        RATE_LIMIT_NOTE,
       inputSchema: {
-        order_id: z.string().min(1).describe("Order CUID"),
+        order_id: z
+          .string()
+          .regex(CUID_PATTERN, "Expected StarkFi CUID-like id starting with 'c'.")
+          .describe("Order CUID from order_create or order_list."),
         patch: z
           .record(z.unknown())
+          .refine((patch) => Object.keys(patch).length > 0, {
+            message: "Patch payload cannot be empty.",
+          })
           .describe(
             "Partial JSON body per StarkFi update-order docs (e.g. { \"amount_from\": \"150.00\" })",
           ),
@@ -150,9 +213,13 @@ export function registerOrderTools(server: McpServer, client: StarkFiHttpClient)
     {
       title: "Enable or disable order template",
       description:
-        "**When to use:** Flip the active flag on an order template so it can or cannot be used for new payments. Idempotent toggle per API semantics.",
+        "**When to use:** Flip an order template active flag to allow/block new payments without deleting template data.\n\n**Success shape:** `{ status: \"order_activated\" | \"order_deactivated\", data: { id, active } }`.\n\n**Common errors + recovery:** `order_not_found` -> refresh list and retry with valid id.\n\n" +
+        RATE_LIMIT_NOTE,
       inputSchema: {
-        order_id: z.string().min(1).describe("Order CUID"),
+        order_id: z
+          .string()
+          .regex(CUID_PATTERN, "Expected StarkFi CUID-like id starting with 'c'.")
+          .describe("Order CUID to toggle."),
       },
     },
     async ({ order_id }) => {
